@@ -1,17 +1,11 @@
 """
 ==============================================================================
- LULC & Landslide Causation Dashboard
- Interactive spatial dashboard (Streamlit + Folium) to analyze land use
- change and landslide causation - inspired by ESA WorldCover viewer.
-==============================================================================
- Author : Generated for Kandy Landslide LULC Project
- Input  : LULC GeoTIFF raster(s) (classified, values 1-8)
-          Landslide site locations (Shapefile .shp or KML .kml)
+ Research-Grade LULC & Landslide Causation Dashboard
+ Guaranteed Map Render Edition (Fixed Height & Streamlit-Folium Sync)
 ==============================================================================
 """
 
 import os
-import io
 import tempfile
 import numpy as np
 import pandas as pd
@@ -19,23 +13,19 @@ import streamlit as st
 import geopandas as gpd
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.sample import sample_gen
-from shapely.geometry import Point
+from rasterio.mask import mask
 import folium
-from folium.plugins import DualMap, MarkerCluster, MiniMap, Fullscreen
+from folium.plugins import DualMap, Fullscreen, MeasureControl, MousePosition
 from streamlit_folium import st_folium
-from PIL import Image
 import plotly.express as px
-import plotly.graph_objects as go
-
-# Enable KML reading in geopandas/fiona
 import fiona
+
+# Enable KML drivers in fiona
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-
 # ==============================================================================
-# CONFIG - Must match the class codes used in the GEE classification script
+# CLASS CONFIGURATION (GEE Scheme)
 # ==============================================================================
 CLASS_INFO = {
     1: {"name": "Dense Forest",              "color": "#006400"},
@@ -47,42 +37,34 @@ CLASS_INFO = {
     7: {"name": "Paddy / Cropland",           "color": "#FFD700"},
     8: {"name": "Road / Rock / Barren",       "color": "#808080"},
 }
-NODATA_VALUE = 0  # pixels with no class / masked out
 
 st.set_page_config(
-    page_title="LULC & Landslide Dashboard",
+    page_title="Research-Grade LULC Dashboard",
     page_icon="🛰️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ==============================================================================
-# STYLING - clean, modern, professional
-# ==============================================================================
+# Custom CSS to force iframe map to display properly
 st.markdown("""
 <style>
-    .main { background-color: #f7f9fb; }
-    .block-container { padding-top: 1.5rem; }
-    div[data-testid="stMetricValue"] { font-size: 1.6rem; color: #1f4e3d; }
-    h1, h2, h3 { color: #123524; }
-    .stat-card {
-        background: white; border-radius: 12px; padding: 1rem 1.2rem;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 0.8rem;
-    }
-    section[data-testid="stSidebar"] { background-color: #10261c; }
-    section[data-testid="stSidebar"] * { color: #eef5f0 !important; }
+    .main { background-color: #0b0f19; color: #ffffff; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 1.5rem; }
+    h1, h2, h3 { color: #00e676; }
+    section[data-testid="stSidebar"] { background-color: #121824; }
+    section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
+    div[data-testid="stMetricValue"] { font-size: 1.5rem; color: #00e676; }
+    iframe { width: 100% !important; min-height: 600px !important; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ==============================================================================
-# CACHED HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ==============================================================================
 
 @st.cache_data(show_spinner=False)
-def load_raster_bytes(file_bytes, filename):
-    """Save uploaded raster bytes to a temp file and return the path."""
+def save_uploaded_bytes(file_bytes, filename):
     suffix = os.path.splitext(filename)[1]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(file_bytes)
@@ -91,10 +73,33 @@ def load_raster_bytes(file_bytes, filename):
 
 
 @st.cache_data(show_spinner=False)
-def reproject_raster_to_4326(raster_path):
-    """Reproject a classified raster to EPSG:4326 for web map display.
-    Returns: rgba array (H,W,4 uint8), bounds [[south,west],[north,east]]
-    """
+def load_landslide_vector(file_bytes, filename):
+    suffix = os.path.splitext(filename)[1].lower()
+    tmp_dir = tempfile.mkdtemp()
+
+    if suffix == ".kml":
+        tmp_path = os.path.join(tmp_dir, "data.kml")
+        with open(tmp_path, "wb") as f:
+            f.write(file_bytes)
+        gdf = gpd.read_file(tmp_path, driver="KML")
+    elif suffix == ".zip":
+        tmp_path = os.path.join(tmp_dir, "data.zip")
+        with open(tmp_path, "wb") as f:
+            f.write(file_bytes)
+        gdf = gpd.read_file(f"zip://{tmp_path}")
+    else:
+        raise ValueError("Upload a .kml file or a zipped shapefile (.zip)")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    return gdf
+
+
+@st.cache_data(show_spinner=False)
+def reproject_raster_to_rgba(raster_path, opacity_val=0.85):
     with rasterio.open(raster_path) as src:
         dst_crs = "EPSG:4326"
         transform, width, height = calculate_default_transform(
@@ -112,13 +117,13 @@ def reproject_raster_to_4326(raster_path):
             resampling=Resampling.nearest,
         )
 
-        # Compute lat/lon bounds
         left, bottom = transform * (0, height)
         right, top = transform * (width, 0)
         bounds = [[bottom, left], [top, right]]
 
-        # Colorize according to CLASS_INFO
         rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        alpha_byte = int(opacity_val * 255)
+
         for code, info in CLASS_INFO.items():
             hexcol = info["color"].lstrip("#")
             r, g, b = tuple(int(hexcol[i:i+2], 16) for i in (0, 2, 4))
@@ -126,275 +131,255 @@ def reproject_raster_to_4326(raster_path):
             rgba[mask, 0] = r
             rgba[mask, 1] = g
             rgba[mask, 2] = b
-            rgba[mask, 3] = 200  # opacity
-        # nodata stays fully transparent (alpha channel already 0)
+            rgba[mask, 3] = alpha_byte
 
         return rgba, bounds
 
 
-@st.cache_data(show_spinner=False)
-def load_landslide_points(file_bytes, filename):
-    """Load landslide points from KML or Shapefile bytes -> GeoDataFrame (EPSG:4326)."""
-    suffix = os.path.splitext(filename)[1].lower()
+def sample_point_across_rasters(lat, lon, raster_dict):
+    pt_gdf = gpd.GeoDataFrame(geometry=[gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326")
+    results = {}
 
-    if suffix == ".kml":
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
-        tmp.write(file_bytes)
-        tmp.close()
-        gdf = gpd.read_file(tmp.name, driver="KML")
-    elif suffix == ".zip":
-        # zipped shapefile
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        tmp.write(file_bytes)
-        tmp.close()
-        gdf = gpd.read_file(f"zip://{tmp.name}")
-    else:
-        raise ValueError("Upload a .kml file or a zipped shapefile (.zip)")
+    for year_label, path in raster_dict.items():
+        with rasterio.open(path) as src:
+            pt_native = pt_gdf.to_crs(src.crs)
+            coord = [(pt_native.geometry.iloc[0].x, pt_native.geometry.iloc[0].y)]
+            val = list(src.sample(coord))[0][0]
+            val = int(val)
+            class_name = CLASS_INFO.get(val, {}).get("name", "Unknown / NoData")
+            results[year_label] = {"code": val, "class": class_name}
 
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:4326")
-    else:
-        gdf = gdf.to_crs("EPSG:4326")
-
-    # Keep only point geometries
-    gdf = gdf[gdf.geometry.geom_type == "Point"].reset_index(drop=True)
-    return gdf
+    return results
 
 
-def sample_raster_at_points(raster_path, points_gdf):
-    """Sample the raw (native CRS) raster value at each landslide point."""
+def extract_masked_statistics(raster_path, geometry_gdf):
     with rasterio.open(raster_path) as src:
-        pts_native = points_gdf.to_crs(src.crs)
-        coords = [(geom.x, geom.y) for geom in pts_native.geometry]
-        values = [v[0] for v in src.sample(coords)]
-    return values
+        geom_native = geometry_gdf.to_crs(src.crs)
+        shapes = [g for g in geom_native.geometry if g.is_valid]
 
-
-def build_class_dataframe(values):
-    df = pd.DataFrame({"class_code": values})
-    df["class_code"] = df["class_code"].astype(int)
-    df = df[df["class_code"].isin(CLASS_INFO.keys())]
-    df["Land Use"] = df["class_code"].map(lambda c: CLASS_INFO[c]["name"])
-    summary = (
-        df.groupby("Land Use")
-        .size()
-        .reset_index(name="Landslide Count")
-        .sort_values("Landslide Count", ascending=False)
-    )
-    total = summary["Landslide Count"].sum()
-    summary["Percentage"] = (summary["Landslide Count"] / total * 100).round(1)
-    summary["color"] = summary["Land Use"].map(
-        {v["name"]: v["color"] for v in CLASS_INFO.values()}
-    )
-    return summary, total
+        try:
+            out_image, _ = mask(src, shapes, crop=True, nodata=0)
+            pixels = out_image[0].flatten()
+            valid_px = pixels[np.isin(pixels, list(CLASS_INFO.keys()))]
+            return valid_px
+        except Exception:
+            return np.array([])
 
 
 # ==============================================================================
-# SIDEBAR - Data inputs
+# SIDEBAR
 # ==============================================================================
-st.sidebar.title("🛰️ Dashboard Controls")
-st.sidebar.markdown("Upload your classified LULC raster(s) and landslide site "
-                     "locations to begin the analysis.")
+st.sidebar.title("🛰️ GIS Control Panel")
 
-st.sidebar.subheader("1. LULC Raster(s)")
+st.sidebar.subheader("1. LULC Multi-Year Rasters")
 lulc_files = st.sidebar.file_uploader(
-    "Upload one or more classified GeoTIFFs (class values 1-8)",
+    "Upload GeoTIFFs (e.g. 2005.tif, 2010.tif, 2025.tif)",
     type=["tif", "tiff"],
     accept_multiple_files=True,
 )
 
-st.sidebar.subheader("2. Landslide Site Locations")
+st.sidebar.subheader("2. Landslide Layer")
 landslide_file = st.sidebar.file_uploader(
-    "Upload landslide points (.kml or zipped shapefile .zip)",
-    type=["kml", "zip"],
+    "Upload Vector File (.zip shapefile or .kml)",
+    type=["zip", "kml"],
 )
 
-st.sidebar.subheader("3. Map Options")
-show_dual_map = st.sidebar.checkbox("Side-by-side comparison view", value=True)
-overlay_opacity = st.sidebar.slider("LULC layer opacity", 0.2, 1.0, 0.75, 0.05)
+buffer_dist = st.sidebar.slider("Landslide Buffer Distance (Meters)", 0, 500, 100, 25)
+overlay_opacity = st.sidebar.slider("LULC Layer Opacity", 0.2, 1.0, 0.85, 0.05)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Class Legend**"
-)
+st.sidebar.markdown("**LULC Class Legend**")
 for code, info in CLASS_INFO.items():
     st.sidebar.markdown(
         f"<span style='display:inline-block;width:12px;height:12px;"
-        f"background:{info['color']};margin-right:6px;border-radius:2px;'></span>"
-        f"{info['name']}",
+        f"background:{info['color']};margin-right:8px;border-radius:2px;'></span>"
+        f"**{info['name']}**",
         unsafe_allow_html=True,
     )
 
 
 # ==============================================================================
-# MAIN HEADER
+# MAIN PAGE PROCESSING
 # ==============================================================================
-st.title("🛰️ LULC & Landslide Causation Dashboard")
-st.caption(
-    "Analyze land use / land cover change over time and identify which land "
-    "use types are most associated with landslide occurrence."
-)
+st.title("🛰️ Research-Grade LULC & Landslide Web GIS Dashboard")
 
 if not lulc_files:
-    st.info("👈 Upload at least one classified LULC GeoTIFF from the sidebar to get started.")
+    st.info("👈 Please upload your classified LULC GeoTIFFs in the sidebar to load the map.")
     st.stop()
 
+raster_dict = {}
+for f in lulc_files:
+    path = save_uploaded_bytes(f.getvalue(), f.name)
+    raster_dict[f.name] = path
 
-# ==============================================================================
-# PERIOD SELECTION
-# ==============================================================================
-period_labels = [f.name for f in lulc_files]
-selected_label = st.selectbox("Select LULC period to display on the map", period_labels)
-selected_file = lulc_files[period_labels.index(selected_label)]
+sorted_periods = sorted(list(raster_dict.keys()))
 
-raster_path = load_raster_bytes(selected_file.getvalue(), selected_file.name)
-rgba, bounds = reproject_raster_to_4326(raster_path)
-
-center_lat = (bounds[0][0] + bounds[1][0]) / 2
-center_lon = (bounds[0][1] + bounds[1][1]) / 2
-
-
-# ==============================================================================
-# LOAD LANDSLIDE POINTS (once, reused across all periods)
-# ==============================================================================
 landslide_gdf = None
+buffered_gdf = None
+
 if landslide_file is not None:
-    landslide_gdf = load_landslide_points(landslide_file.getvalue(), landslide_file.name)
+    try:
+        landslide_gdf = load_landslide_vector(landslide_file.getvalue(), landslide_file.name)
+        st.sidebar.success(f"Loaded {len(landslide_gdf)} Landslide Features")
+
+        if buffer_dist > 0:
+            projected = landslide_gdf.to_crs("EPSG:3857")
+            projected_buffer = projected.buffer(buffer_dist)
+            buffered_gdf = gpd.GeoDataFrame(geometry=projected_buffer, crs="EPSG:3857").to_crs("EPSG:4326")
+        else:
+            buffered_gdf = landslide_gdf.copy()
+
+    except Exception as e:
+        st.sidebar.error(f"Vector Layer Error: {e}")
 
 
 # ==============================================================================
-# MAP SECTION
+# SYNCHRONIZED DUAL-MAP VIEW
 # ==============================================================================
-st.subheader(f"🗺️ Interactive Map — {selected_label}")
+st.subheader("🗺️ Synchronized Dual-Map Comparison View")
 
-if show_dual_map:
-    m = DualMap(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
-    target_maps = [m.m1, m.m2]
-    left_title, right_title = "LULC Classification Only", "LULC + Landslide Sites"
-else:
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
-    target_maps = [m]
+c_left, c_right = st.columns(2)
+with c_left:
+    left_year = st.selectbox("Left Map Period (T1)", sorted_periods, index=0)
+with c_right:
+    right_idx = len(sorted_periods) - 1 if len(sorted_periods) > 1 else 0
+    right_year = st.selectbox("Right Map Period (T2)", sorted_periods, index=right_idx)
 
-for i, tm in enumerate(target_maps):
-    folium.raster_layers.ImageOverlay(
-        image=rgba,
-        bounds=bounds,
-        opacity=overlay_opacity,
-        name=f"LULC - {selected_label}",
-    ).add_to(tm)
-    folium.TileLayer("Esri.WorldImagery", name="Satellite Basemap").add_to(tm)
+rgba_left, bounds_left = reproject_raster_to_rgba(raster_dict[left_year], overlay_opacity)
+rgba_right, bounds_right = reproject_raster_to_rgba(raster_dict[right_year], overlay_opacity)
 
-    # Only add landslide markers on the second map (right side) or single map
-    add_markers = (not show_dual_map) or (i == 1)
-    if add_markers and landslide_gdf is not None:
-        cluster = MarkerCluster(name="Landslide Sites").add_to(tm)
-        for _, row in landslide_gdf.iterrows():
-            folium.CircleMarker(
-                location=[row.geometry.y, row.geometry.x],
-                radius=5,
-                color="#8B0000",
-                fill=True,
-                fill_color="#FF3333",
-                fill_opacity=0.9,
-                popup=folium.Popup(f"Landslide site<br>Lat: {row.geometry.y:.5f}<br>"
-                                    f"Lon: {row.geometry.x:.5f}", max_width=200),
-            ).add_to(cluster)
+center_lat = (bounds_left[0][0] + bounds_left[1][0]) / 2
+center_lon = (bounds_left[0][1] + bounds_left[1][1]) / 2
 
-    folium.LayerControl(collapsed=False).add_to(tm)
-    Fullscreen().add_to(tm)
+# DualMap Initialization
+m = DualMap(location=[center_lat, center_lon], zoom_start=13, tiles=None)
 
-if show_dual_map:
-    col_l, col_r = st.columns(2)
-    col_l.markdown(f"**{left_title}**")
-    col_r.markdown(f"**{right_title}**")
+# Add Satellite Basemaps
+folium.TileLayer("Esri.WorldImagery", name="Satellite").add_to(m.m1)
+folium.TileLayer("Esri.WorldImagery", name="Satellite").add_to(m.m2)
 
-st_folium(m, width=None, height=560, returned_objects=[])
+# Add LULC Overlays
+folium.raster_layers.ImageOverlay(
+    image=rgba_left, bounds=bounds_left, opacity=overlay_opacity, name=f"LULC {left_year}"
+).add_to(m.m1)
+
+folium.raster_layers.ImageOverlay(
+    image=rgba_right, bounds=bounds_right, opacity=overlay_opacity, name=f"LULC {right_year}"
+).add_to(m.m2)
+
+# Add Landslide Layer to both panes
+if buffered_gdf is not None:
+    for map_pane in [m.m1, m.m2]:
+        folium.GeoJson(
+            buffered_gdf,
+            name=f"Landslide Boundary / Buffer ({buffer_dist}m)",
+            style_function=lambda x: {
+                'fillColor': '#ff0000',
+                'color': '#8b0000',
+                'weight': 2.5,
+                'fillOpacity': 0.4
+            }
+        ).add_to(map_pane)
+
+Fullscreen().add_to(m.m1)
+MeasureControl(position='bottomleft').add_to(m.m1)
+MousePosition().add_to(m.m1)
+
+folium.LayerControl(collapsed=False).add_to(m.m1)
+folium.LayerControl(collapsed=False).add_to(m.m2)
+
+# MANDATORY GUARANTEED RENDER CALL FOR STREAMLIT
+map_output = st_folium(
+    m,
+    key="lulc_dual_map",
+    height=600,
+    use_container_width=True,
+    returned_objects=["last_clicked"]
+)
 
 
 # ==============================================================================
-# STATISTICS PANEL
+# CLICK ANYWHERE POINT INSPECTOR & TIMELINE
 # ==============================================================================
 st.markdown("---")
-st.subheader("📊 Landslide Causation Analysis")
+st.subheader("📍 Point Inspection & Temporal LULC Timeline")
 
-if landslide_gdf is None:
-    st.warning("Upload landslide site locations from the sidebar to see causation statistics.")
+if map_output and map_output.get("last_clicked"):
+    click_lat = map_output["last_clicked"]["lat"]
+    click_lon = map_output["last_clicked"]["lng"]
+
+    timeline_data = sample_point_across_rasters(click_lat, click_lon, raster_dict)
+
+    st.write(f"**Inspected Coordinate:** Lat `{click_lat:.5f}`, Lon `{click_lon:.5f}`")
+
+    timeline_rows = []
+    for yr_name, info in timeline_data.items():
+        timeline_rows.append({
+            "LULC Period": yr_name,
+            "Class Code": info["code"],
+            "Land Use": info["class"]
+        })
+
+    df_timeline = pd.DataFrame(timeline_rows)
+
+    col_t1, col_t2 = st.columns([1, 1.5])
+    with col_t1:
+        st.dataframe(df_timeline, hide_index=True, use_container_width=True)
+
+    with col_t2:
+        fig_time = px.line(
+            df_timeline, x="LULC Period", y="Land Use", markers=True,
+            title="LULC Trajectory at Clicked Point",
+        )
+        fig_time.update_layout(height=280, plot_bgcolor="#121824", paper_bgcolor="#121824", font_color="#ffffff")
+        st.plotly_chart(fig_time, use_container_width=True)
 else:
-    values = sample_raster_at_points(raster_path, landslide_gdf)
-    summary, total = build_class_dataframe(values)
+    st.info("👆 Map-la edhavadhu oru spot-a click pannunga, andha spot-oda multi-year land use change timeline inga live-a kaattum.")
 
-    if summary.empty:
-        st.error("No landslide points fell within the raster extent / valid classes. "
-                  "Check that your points and raster cover the same area.")
+
+# ==============================================================================
+# LANDSLIDE BUFFER AREA ANALYSIS
+# ==============================================================================
+st.markdown("---")
+st.subheader("📊 Landslide Area LULC Causation Analytics")
+
+if buffered_gdf is None:
+    st.warning("Upload a Landslide Shapefile/KML in the sidebar to run buffer extraction analysis.")
+else:
+    target_stat_year = st.selectbox("Select Year for Landslide Zone Analysis", sorted_periods)
+    pixels = extract_masked_statistics(raster_dict[target_stat_year], buffered_gdf)
+
+    if len(pixels) == 0:
+        st.error("No valid pixels found within the landslide zones. Verify spatial overlap / CRS.")
     else:
-        top_row = summary.iloc[0]
+        df_px = pd.DataFrame({"class_code": pixels})
+        df_px["Land Use"] = df_px["class_code"].map(lambda c: CLASS_INFO[c]["name"])
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Landslide Sites Analyzed", int(total))
-        c2.metric("Leading Land Use Cause", top_row["Land Use"])
-        c3.metric("Share on Leading Land Use", f"{top_row['Percentage']}%")
+        summary = df_px.groupby("Land Use").size().reset_index(name="Pixel Count")
+        total_px = summary["Pixel Count"].sum()
+        summary["Percentage (%)"] = ((summary["Pixel Count"] / total_px) * 100).round(2)
+        summary["Color"] = summary["Land Use"].map({v["name"]: v["color"] for v in CLASS_INFO.values()})
+        summary = summary.sort_values("Percentage (%)", ascending=False)
 
-        col_chart, col_table = st.columns([1.3, 1])
+        top_cause = summary.iloc[0]
 
-        with col_chart:
-            fig = px.bar(
-                summary.sort_values("Percentage"),
-                x="Percentage", y="Land Use", orientation="h",
-                text="Percentage",
-                color="Land Use",
-                color_discrete_map={row["Land Use"]: row["color"] for _, row in summary.iterrows()},
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Analyzed Zone Pixels", f"{total_px:,}")
+        m2.metric("Primary Causative Cover", top_cause["Land Use"])
+        m3.metric("Dominant Cover Share", f"{top_cause['Percentage (%)']}%")
+
+        c_chart, c_table = st.columns([1.4, 1])
+
+        with c_chart:
+            fig_bar = px.bar(
+                summary, x="Percentage (%)", y="Land Use", orientation="h",
+                text="Percentage (%)", color="Land Use",
+                color_discrete_map={r["Land Use"]: r["Color"] for _, r in summary.iterrows()},
+                title=f"LULC Breakdown within Landslide Zone ({target_stat_year})"
             )
-            fig.update_traces(texttemplate="%{text}%", textposition="outside")
-            fig.update_layout(
-                showlegend=False, height=380,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="% of Landslides", yaxis_title="",
-                plot_bgcolor="white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
+            fig_bar.update_layout(showlegend=False, height=360, plot_bgcolor="#121824", paper_bgcolor="#121824", font_color="#ffffff")
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-        with col_table:
-            st.markdown("**Breakdown Table**")
-            st.dataframe(
-                summary[["Land Use", "Landslide Count", "Percentage"]]
-                .rename(columns={"Percentage": "Percentage (%)"}),
-                hide_index=True,
-                use_container_width=True,
-            )
-
-        # ----------------------------------------------------------------
-        # Multi-period comparison (if more than one LULC raster uploaded)
-        # ----------------------------------------------------------------
-        if len(lulc_files) > 1:
-            st.markdown("---")
-            st.subheader("📈 Landslide Land Use — Comparison Across All Uploaded Periods")
-            st.caption("Shows what land use was recorded at the landslide points in "
-                       "EACH uploaded period (e.g. compare pre- vs post-landslide land use).")
-
-            all_period_rows = []
-            for f in lulc_files:
-                p_path = load_raster_bytes(f.getvalue(), f.name)
-                p_values = sample_raster_at_points(p_path, landslide_gdf)
-                p_summary, p_total = build_class_dataframe(p_values)
-                p_summary["Period"] = f.name
-                all_period_rows.append(p_summary)
-
-            comp_df = pd.concat(all_period_rows, ignore_index=True)
-
-            fig2 = px.bar(
-                comp_df, x="Period", y="Percentage", color="Land Use",
-                barmode="stack",
-                color_discrete_map={v["name"]: v["color"] for v in CLASS_INFO.values()},
-                text="Percentage",
-            )
-            fig2.update_layout(
-                height=420, plot_bgcolor="white",
-                yaxis_title="% of Landslide Sites", xaxis_title="",
-                legend_title="Land Use",
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-
-st.markdown("---")
-st.caption("Dashboard built with Streamlit, Folium & Rasterio · "
-           "Class scheme matches the 8-class GEE Random Forest LULC classification.")
+        with c_table:
+            st.dataframe(summary[["Land Use", "Pixel Count", "Percentage (%)"]], hide_index=True, use_container_width=True)
