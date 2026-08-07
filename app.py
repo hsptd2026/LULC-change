@@ -1,31 +1,23 @@
-"""
-==============================================================================
- Research-Grade LULC & Landslide Causation Dashboard
- Guaranteed Map Render Edition (Fixed Height & Streamlit-Folium Sync)
-==============================================================================
-"""
-
 import os
+import json
 import tempfile
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import geopandas as gpd
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.mask import mask
-import folium
-from folium.plugins import DualMap, Fullscreen, MeasureControl, MousePosition
-from streamlit_folium import st_folium
+from rasterio.features import geometry_mask
+from shapely import wkt as shapely_wkt
+from shapely.ops import unary_union
+from PIL import Image
+import streamlit.components.v1 as components
 import plotly.express as px
-import fiona
-
-# Enable KML drivers in fiona
-fiona.drvsupport.supported_drivers['KML'] = 'rw'
-fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
 # ==============================================================================
-# CLASS CONFIGURATION (GEE Scheme)
+# CLASS CONFIGURATION
 # ==============================================================================
 CLASS_INFO = {
     1: {"name": "Dense Forest",              "color": "#006400"},
@@ -39,25 +31,23 @@ CLASS_INFO = {
 }
 
 st.set_page_config(
-    page_title="Research-Grade LULC Dashboard",
+    page_title="ESA WorldCover LULC Dashboard",
     page_icon="🛰️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS to force iframe map to display properly
 st.markdown("""
 <style>
-    .main { background-color: #0b0f19; color: #ffffff; }
-    .block-container { padding-top: 1.5rem; padding-bottom: 1.5rem; }
-    h1, h2, h3 { color: #00e676; }
-    section[data-testid="stSidebar"] { background-color: #121824; }
-    section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-    div[data-testid="stMetricValue"] { font-size: 1.5rem; color: #00e676; }
-    iframe { width: 100% !important; min-height: 600px !important; border-radius: 8px; }
+    .main { background-color: #0d1117; color: #e6edf3; }
+    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+    h1, h2, h3 { color: #2ea043; }
+    section[data-testid="stSidebar"] { background-color: #161b22; }
+    section[data-testid="stSidebar"] * { color: #f0f6fc !important; }
+    div[data-testid="stMetricValue"] { font-size: 1.5rem; color: #3fb950; }
+    iframe { border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
 </style>
 """, unsafe_allow_html=True)
-
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -73,22 +63,22 @@ def save_uploaded_bytes(file_bytes, filename):
 
 
 @st.cache_data(show_spinner=False)
-def load_landslide_vector(file_bytes, filename):
+def load_boundary_vector(file_bytes, filename):
+    """Load the boundary/landslide vector (points OR polygons) as EPSG:4326."""
     suffix = os.path.splitext(filename)[1].lower()
     tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, filename)
+    with open(tmp_path, "wb") as f:
+        f.write(file_bytes)
 
     if suffix == ".kml":
-        tmp_path = os.path.join(tmp_dir, "data.kml")
-        with open(tmp_path, "wb") as f:
-            f.write(file_bytes)
-        gdf = gpd.read_file(tmp_path, driver="KML")
+        gdf = gpd.read_file(tmp_path, engine="pyogrio")
     elif suffix == ".zip":
-        tmp_path = os.path.join(tmp_dir, "data.zip")
-        with open(tmp_path, "wb") as f:
-            f.write(file_bytes)
-        gdf = gpd.read_file(f"zip://{tmp_path}")
+        gdf = gpd.read_file(f"zip://{tmp_path}", engine="pyogrio")
+    elif suffix in [".geojson", ".json"]:
+        gdf = gpd.read_file(tmp_path, engine="pyogrio")
     else:
-        raise ValueError("Upload a .kml file or a zipped shapefile (.zip)")
+        raise ValueError("Upload a .kml, .geojson, or zipped shapefile (.zip)")
 
     if gdf.crs is None:
         gdf = gdf.set_crs("EPSG:4326")
@@ -98,8 +88,23 @@ def load_landslide_vector(file_bytes, filename):
     return gdf
 
 
+def feature_label(row, idx):
+    """Best-effort human readable label for a boundary feature."""
+    for col in ["name", "Name", "NAME", "id", "ID", "Id", "label", "Label", "title", "Title"]:
+        if col in row.index and pd.notna(row[col]) and str(row[col]).strip():
+            return str(row[col])
+    return f"Boundary Feature #{idx + 1}"
+
+
 @st.cache_data(show_spinner=False)
-def reproject_raster_to_rgba(raster_path, opacity_val=0.85):
+def reproject_raster_to_rgba(raster_path, opacity_val=0.85, mask_wkt=None):
+    """Reproject a classified raster to EPSG:4326 RGBA.
+
+    If mask_wkt is provided (a single WKT polygon/multipolygon string), every
+    pixel OUTSIDE that geometry is forced fully transparent - this is what
+    makes the LULC colours strictly confined to the uploaded boundary /
+    buffer zone instead of spilling across the raster's full extent.
+    """
     with rasterio.open(raster_path) as src:
         dst_crs = "EPSG:4326"
         transform, width, height = calculate_default_transform(
@@ -127,38 +132,36 @@ def reproject_raster_to_rgba(raster_path, opacity_val=0.85):
         for code, info in CLASS_INFO.items():
             hexcol = info["color"].lstrip("#")
             r, g, b = tuple(int(hexcol[i:i+2], 16) for i in (0, 2, 4))
-            mask = dst_array == code
-            rgba[mask, 0] = r
-            rgba[mask, 1] = g
-            rgba[mask, 2] = b
-            rgba[mask, 3] = alpha_byte
+            class_mask = (dst_array == code)
+            rgba[class_mask, 0] = r
+            rgba[class_mask, 1] = g
+            rgba[class_mask, 2] = b
+            rgba[class_mask, 3] = alpha_byte
+
+        # --- Strictly confine colour to the boundary / buffer geometry ---
+        if mask_wkt:
+            geom = shapely_wkt.loads(mask_wkt)
+            # geometry_mask default (invert=False) => True OUTSIDE the shapes.
+            outside = geometry_mask([geom], out_shape=(height, width), transform=transform, invert=False)
+            rgba[outside, 3] = 0  # force transparent outside the boundary
 
         return rgba, bounds
 
 
-def sample_point_across_rasters(lat, lon, raster_dict):
-    pt_gdf = gpd.GeoDataFrame(geometry=[gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326")
-    results = {}
-
-    for year_label, path in raster_dict.items():
-        with rasterio.open(path) as src:
-            pt_native = pt_gdf.to_crs(src.crs)
-            coord = [(pt_native.geometry.iloc[0].x, pt_native.geometry.iloc[0].y)]
-            val = list(src.sample(coord))[0][0]
-            val = int(val)
-            class_name = CLASS_INFO.get(val, {}).get("name", "Unknown / NoData")
-            results[year_label] = {"code": val, "class": class_name}
-
-    return results
-
-
-def extract_masked_statistics(raster_path, geometry_gdf):
+def extract_masked_statistics(raster_path, geom_wkt):
+    """Sample class pixels strictly inside the given WKT geometry (native CRS reprojected)."""
+    if not geom_wkt:
+        return np.array([])
     with rasterio.open(raster_path) as src:
-        geom_native = geometry_gdf.to_crs(src.crs)
-        shapes = [g for g in geom_native.geometry if g.is_valid]
-
+        geom_4326 = shapely_wkt.loads(geom_wkt)
+        geom_gdf = gpd.GeoDataFrame(geometry=[geom_4326], crs="EPSG:4326")
+        geom_native = geom_gdf.to_crs(src.crs)
+        shapes = [g.__geo_interface__ for g in geom_native.geometry if g.is_valid]
+        if not shapes:
+            return np.array([])
         try:
-            out_image, _ = mask(src, shapes, crop=True, nodata=0)
+            from rasterio.mask import mask as rio_mask
+            out_image, _ = rio_mask(src, shapes, crop=True, nodata=0)
             pixels = out_image[0].flatten()
             valid_px = pixels[np.isin(pixels, list(CLASS_INFO.keys()))]
             return valid_px
@@ -166,29 +169,53 @@ def extract_masked_statistics(raster_path, geometry_gdf):
             return np.array([])
 
 
+def gdf_to_geojson_dict(gdf):
+    if gdf is None or len(gdf) == 0:
+        return None
+    return json.loads(gdf.to_json())
+
+
+def rgba_array_to_data_uri(rgba_array):
+    img = Image.fromarray(rgba_array, mode="RGBA")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    import base64
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
 # ==============================================================================
 # SIDEBAR
 # ==============================================================================
-st.sidebar.title("🛰️ GIS Control Panel")
+st.sidebar.title("🛰️ Dashboard Controls")
 
-st.sidebar.subheader("1. LULC Multi-Year Rasters")
+st.sidebar.subheader("1. Boundary / Landslide Outline")
+st.sidebar.caption("Upload this FIRST — it stays glowing on top of the map and defines the exact zone the LULC rasters are cropped to.")
+landslide_file = st.sidebar.file_uploader(
+    "Upload Boundary (.zip shapefile / .kml / .geojson)",
+    type=["zip", "kml", "geojson", "json"],
+)
+
+st.sidebar.subheader("2. Multi-Year LULC Rasters")
 lulc_files = st.sidebar.file_uploader(
-    "Upload GeoTIFFs (e.g. 2005.tif, 2010.tif, 2025.tif)",
+    "Upload GeoTIFFs (e.g., 2005.tif, 2025.tif)",
     type=["tif", "tiff"],
     accept_multiple_files=True,
 )
 
-st.sidebar.subheader("2. Landslide Layer")
-landslide_file = st.sidebar.file_uploader(
-    "Upload Vector File (.zip shapefile or .kml)",
-    type=["zip", "kml"],
+buffer_dist = st.sidebar.slider("Boundary Buffer (Meters)", 0, 500, 50, 25)
+overlay_opacity = st.sidebar.slider("LULC Layer Opacity", 0.2, 1.0, 0.85, 0.05)
+restrict_colors_to_boundary = st.sidebar.checkbox(
+    "Restrict LULC colours to boundary only",
+    value=False,
+    help="OFF (default): full classified LULC colour shows everywhere, like ESA WorldCover, "
+         "with your boundary glowing on top as a highlight — zoom in to inspect a site closely. "
+         "ON: LULC colour is masked to strictly inside the boundary/buffer, everything else "
+         "left transparent. Statistics below always use the boundary-restricted pixels either way.",
 )
 
-buffer_dist = st.sidebar.slider("Landslide Buffer Distance (Meters)", 0, 500, 100, 25)
-overlay_opacity = st.sidebar.slider("LULC Layer Opacity", 0.2, 1.0, 0.85, 0.05)
-
 st.sidebar.markdown("---")
-st.sidebar.markdown("**LULC Class Legend**")
+st.sidebar.markdown("**Class Legend**")
 for code, info in CLASS_INFO.items():
     st.sidebar.markdown(
         f"<span style='display:inline-block;width:12px;height:12px;"
@@ -197,189 +224,400 @@ for code, info in CLASS_INFO.items():
         unsafe_allow_html=True,
     )
 
+# ==============================================================================
+# MAIN PAGE
+# ==============================================================================
+st.title("🛰️ ESA WorldCover Style LULC Swipe & Boundary Dashboard")
 
-# ==============================================================================
-# MAIN PAGE PROCESSING
-# ==============================================================================
-st.title("🛰️ Research-Grade LULC & Landslide Web GIS Dashboard")
+if landslide_file is None:
+    st.info("👈 Start by uploading your boundary / landslide outline (.zip, .kml, or .geojson) in the sidebar. "
+            "It will glow on top of the map, and the LULC rasters you upload next will be cropped strictly to it.")
+    st.stop()
 
 if not lulc_files:
-    st.info("👈 Please upload your classified LULC GeoTIFFs in the sidebar to load the map.")
+    st.info("👈 Boundary loaded. Now upload one or more LULC GeoTIFFs from the sidebar to overlay behind it.")
+
+# --- Load boundary ---
+landslide_gdf = None
+buffered_gdf = None
+try:
+    landslide_gdf = load_boundary_vector(landslide_file.getvalue(), landslide_file.name)
+    st.sidebar.success(f"Loaded {len(landslide_gdf)} boundary feature(s)")
+
+    if buffer_dist > 0:
+        projected = landslide_gdf.to_crs("EPSG:3857")
+        projected_buffer = projected.buffer(buffer_dist)
+        buffered_gdf = gpd.GeoDataFrame(
+            landslide_gdf.drop(columns="geometry").reset_index(drop=True),
+            geometry=projected_buffer.reset_index(drop=True),
+            crs="EPSG:3857",
+        ).to_crs("EPSG:4326")
+    else:
+        # Points with 0 buffer have no area - always apply a tiny minimum
+        # buffer so point-based boundaries still produce a visible/maskable zone.
+        geom_types = landslide_gdf.geometry.geom_type.unique()
+        if any(t in ["Point", "MultiPoint"] for t in geom_types):
+            projected = landslide_gdf.to_crs("EPSG:3857")
+            projected_buffer = projected.buffer(25)
+            buffered_gdf = gpd.GeoDataFrame(
+                landslide_gdf.drop(columns="geometry").reset_index(drop=True),
+                geometry=projected_buffer.reset_index(drop=True),
+                crs="EPSG:3857",
+            ).to_crs("EPSG:4326")
+        else:
+            buffered_gdf = landslide_gdf.copy()
+except Exception as e:
+    st.sidebar.error(f"Boundary load error: {e}")
+    st.stop()
+
+# --- Feature selector: analyze ALL boundaries together, or click into ONE ---
+feature_options = ["🌐 All Boundaries (Combined)"] + [
+    feature_label(row, i) for i, row in landslide_gdf.iterrows()
+]
+selected_feature = st.selectbox(
+    "🎯 Select a boundary to inspect (choose one landslide site for a focused comparison, "
+    "or keep 'All Boundaries' to analyze everything together)",
+    feature_options,
+)
+
+if selected_feature == feature_options[0]:
+    selection_gdf = buffered_gdf
+else:
+    sel_idx = feature_options.index(selected_feature) - 1
+    selection_gdf = buffered_gdf.iloc[[sel_idx]]
+
+# Single merged geometry (WKT) used for raster masking + stats - this is the
+# "hashable" cache key that lets reproject_raster_to_rgba stay cached per selection.
+selection_geom = unary_union(selection_gdf.geometry.values)
+selection_wkt = selection_geom.wkt
+
+if not lulc_files:
     st.stop()
 
 raster_dict = {}
 for f in lulc_files:
     path = save_uploaded_bytes(f.getvalue(), f.name)
     raster_dict[f.name] = path
-
 sorted_periods = sorted(list(raster_dict.keys()))
 
-landslide_gdf = None
-buffered_gdf = None
-
-if landslide_file is not None:
-    try:
-        landslide_gdf = load_landslide_vector(landslide_file.getvalue(), landslide_file.name)
-        st.sidebar.success(f"Loaded {len(landslide_gdf)} Landslide Features")
-
-        if buffer_dist > 0:
-            projected = landslide_gdf.to_crs("EPSG:3857")
-            projected_buffer = projected.buffer(buffer_dist)
-            buffered_gdf = gpd.GeoDataFrame(geometry=projected_buffer, crs="EPSG:3857").to_crs("EPSG:4326")
-        else:
-            buffered_gdf = landslide_gdf.copy()
-
-    except Exception as e:
-        st.sidebar.error(f"Vector Layer Error: {e}")
-
-
 # ==============================================================================
-# SYNCHRONIZED DUAL-MAP VIEW
+# PERIOD SELECTION
 # ==============================================================================
-st.subheader("🗺️ Synchronized Dual-Map Comparison View")
-
-c_left, c_right = st.columns(2)
-with c_left:
-    left_year = st.selectbox("Left Map Period (T1)", sorted_periods, index=0)
-with c_right:
+col_l, col_r = st.columns(2)
+with col_l:
+    left_period = st.selectbox("Left Map Period (T1)", sorted_periods, index=0)
+with col_r:
     right_idx = len(sorted_periods) - 1 if len(sorted_periods) > 1 else 0
-    right_year = st.selectbox("Right Map Period (T2)", sorted_periods, index=right_idx)
+    right_period = st.selectbox("Right Map Period (T2)", sorted_periods, index=right_idx)
 
-rgba_left, bounds_left = reproject_raster_to_rgba(raster_dict[left_year], overlay_opacity)
-rgba_right, bounds_right = reproject_raster_to_rgba(raster_dict[right_year], overlay_opacity)
+# Both rasters are reprojected AND masked to the selected boundary/buffer -
+# this is what stops LULC colour from spilling outside your study area and
+# makes the swipe comparison strictly about the zone you care about.
+display_mask_wkt = selection_wkt if restrict_colors_to_boundary else None
+rgba_left, bounds_left = reproject_raster_to_rgba(raster_dict[left_period], overlay_opacity, display_mask_wkt)
+rgba_right, bounds_right = reproject_raster_to_rgba(raster_dict[right_period], overlay_opacity, display_mask_wkt)
 
-center_lat = (bounds_left[0][0] + bounds_left[1][0]) / 2
-center_lon = (bounds_left[0][1] + bounds_left[1][1]) / 2
+sel_bounds = selection_gdf.total_bounds  # [minx, miny, maxx, maxy]
+center_lat = (sel_bounds[1] + sel_bounds[3]) / 2
+center_lon = (sel_bounds[0] + sel_bounds[2]) / 2
+fit_bounds_latlon = [[sel_bounds[1], sel_bounds[0]], [sel_bounds[3], sel_bounds[2]]]
 
-# DualMap Initialization
-m = DualMap(location=[center_lat, center_lon], zoom_start=13, tiles=None)
+uri_left = rgba_array_to_data_uri(rgba_left)
+uri_right = rgba_array_to_data_uri(rgba_right)
 
-# Add Satellite Basemaps
-folium.TileLayer("Esri.WorldImagery", name="Satellite").add_to(m.m1)
-folium.TileLayer("Esri.WorldImagery", name="Satellite").add_to(m.m2)
+boundary_geojson = gdf_to_geojson_dict(selection_gdf)
+boundary_geojson_str = json.dumps(boundary_geojson) if boundary_geojson else "null"
 
-# Add LULC Overlays
-folium.raster_layers.ImageOverlay(
-    image=rgba_left, bounds=bounds_left, opacity=overlay_opacity, name=f"LULC {left_year}"
-).add_to(m.m1)
+MAP_HEIGHT_PX = 640
 
-folium.raster_layers.ImageOverlay(
-    image=rgba_right, bounds=bounds_right, opacity=overlay_opacity, name=f"LULC {right_year}"
-).add_to(m.m2)
+# ==============================================================================
+# MAP: vanilla-JS Leaflet swipe (no risky third-party plugin dependency).
+# Layer order (bottom -> top):
+#   1. Satellite basemap
+#   2. LULC T1 (masked to boundary) - always fully visible underneath
+#   3. LULC T2 (masked to boundary) - clipped by the swipe divider, on top of T1
+#   4. Boundary glow (outer wide translucent stroke + inner dashed border) -
+#      added LAST so it always sits above both LULC layers, on BOTH sides of
+#      the swipe, completely unaffected by the divider.
+# ==============================================================================
+_MAP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin:0; padding:0; width:100%; height:__HEIGHT_PX__px; background:#0b0f19; overflow:hidden; }
+  #map-wrap { position:relative; width:100%; height:__HEIGHT_PX__px; background:#0b0f19; }
+  #map { position:absolute; top:0; left:0; right:0; bottom:0; }
+  #err-box {
+    display:none; position:absolute; top:0; left:0; right:0; z-index:2000;
+    background:#3b0d0d; color:#ffb4b4; font-family:monospace; font-size:12px;
+    padding:10px 14px; border-bottom:2px solid #ff4d4d; white-space:pre-wrap;
+  }
+  .panel-label {
+    position:absolute; top:12px; z-index:900; background:rgba(11,15,25,0.88);
+    color:#00e676; font-family:sans-serif; font-weight:700; font-size:13px;
+    padding:5px 12px; border-radius:6px; border:1px solid #00e676;
+    pointer-events:none;
+  }
+  #label-left { left:12px; }
+  #label-right { right:12px; }
+  #coord-box {
+    position:absolute; bottom:12px; left:12px; z-index:900;
+    background:rgba(11,15,25,0.88); color:#e2e8f0; font-family:monospace;
+    font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid #333;
+  }
+  #divider {
+    position:absolute; top:0; bottom:0; width:4px; margin-left:-2px;
+    background:#00e676; z-index:950; cursor:ew-resize; box-shadow:0 0 6px rgba(0,230,118,0.8);
+  }
+  #divider::after {
+    content:"\\2194"; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:32px; height:32px; line-height:32px; text-align:center; border-radius:50%;
+    background:#00e676; color:#0b0f19; font-weight:bold; font-size:16px;
+  }
+</style>
+</head>
+<body>
+<div id="map-wrap">
+  <div id="err-box"></div>
+  <div id="map"></div>
+  <div class="panel-label" id="label-left">LULC __LEFT_LABEL__</div>
+  <div class="panel-label" id="label-right">LULC __RIGHT_LABEL__</div>
+  <div id="divider"></div>
+  <div id="coord-box">Drag the center handle to swipe between years</div>
+</div>
 
-# Add Landslide Layer to both panes
-if buffered_gdf is not None:
-    for map_pane in [m.m1, m.m2]:
-        folium.GeoJson(
-            buffered_gdf,
-            name=f"Landslide Boundary / Buffer ({buffer_dist}m)",
-            style_function=lambda x: {
-                'fillColor': '#ff0000',
-                'color': '#8b0000',
-                'weight': 2.5,
-                'fillOpacity': 0.4
-            }
-        ).add_to(map_pane)
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+function showErr(msg) {
+  var box = document.getElementById('err-box');
+  box.style.display = 'block';
+  box.textContent = "Map failed to load: " + msg;
+}
+window.onerror = function(msg) { showErr(msg); return false; };
 
-Fullscreen().add_to(m.m1)
-MeasureControl(position='bottomleft').add_to(m.m1)
-MousePosition().add_to(m.m1)
+try {
+  var map = L.map('map', { zoomControl: true }).setView([__CENTER_LAT__, __CENTER_LON__], 15);
 
-folium.LayerControl(collapsed=False).add_to(m.m1)
-folium.LayerControl(collapsed=False).add_to(m.m2)
+  var esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Esri', maxZoom: 20
+  }).addTo(map);
 
-# MANDATORY GUARANTEED RENDER CALL FOR STREAMLIT
-map_output = st_folium(
-    m,
-    key="lulc_dual_map",
-    height=600,
-    use_container_width=True,
-    returned_objects=["last_clicked"]
+  var osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: 'OSM', maxZoom: 19
+  });
+
+  var leftBounds = __LEFT_BOUNDS__;
+  var rightBounds = __RIGHT_BOUNDS__;
+
+  // Layer 1 (bottom): T1 LULC, masked to boundary, always fully visible
+  var lulcLeft = L.imageOverlay("__URI_LEFT__", leftBounds, { opacity: __OPACITY__ }).addTo(map);
+  // Layer 2 (on top of T1): T2 LULC, masked to boundary, revealed by swipe
+  var lulcRight = L.imageOverlay("__URI_RIGHT__", rightBounds, { opacity: __OPACITY__ }).addTo(map);
+
+  var fitBounds = __FIT_BOUNDS__;
+  map.fitBounds(fitBounds, { padding: [30, 30] });
+
+  // Layer 3 (top, ALWAYS visible on both sides): glowing boundary outline
+  var boundaryData = __GEOJSON__;
+  if (boundaryData) {
+    // Outer glow
+    L.geoJSON(boundaryData, {
+      style: function() {
+        return { color: '#FF0055', weight: 9, opacity: 0.55, fillOpacity: 0 };
+      },
+      interactive: false
+    }).addTo(map);
+    // Sharp dashed inner border
+    L.geoJSON(boundaryData, {
+      style: function() {
+        return { color: '#FFE600', weight: 3, opacity: 1.0, dashArray: '6, 6', fillOpacity: 0 };
+      },
+      onEachFeature: function(feature, layer) {
+        var props = feature.properties || {};
+        var keys = Object.keys(props);
+        if (keys.length > 0) {
+          var txt = keys.slice(0, 4).map(function(k) { return k + ": " + props[k]; }).join("<br>");
+          layer.bindTooltip(txt);
+        }
+      }
+    }).addTo(map);
+  }
+
+  L.control.layers({ "Satellite": esri, "Street Map": osm }, {}, { collapsed: true }).addTo(map);
+  L.control.scale({ position: 'bottomleft' }).addTo(map);
+
+  // ---- Vanilla swipe/reveal slider ----
+  var mapWrap = document.getElementById('map-wrap');
+  var divider = document.getElementById('divider');
+  var dividerFraction = 0.5;
+
+  function applyClip() {
+    var rightEl = lulcRight.getElement();
+    if (!rightEl) return;
+    var wrapRect = mapWrap.getBoundingClientRect();
+    var dividerAbsX = wrapRect.left + wrapRect.width * dividerFraction;
+    var imgRect = rightEl.getBoundingClientRect();
+    var clipPx = dividerAbsX - imgRect.left;
+    if (clipPx < 0) clipPx = 0;
+    rightEl.style.clipPath = "inset(0 0 0 " + clipPx + "px)";
+    rightEl.style.webkitClipPath = "inset(0 0 0 " + clipPx + "px)";
+    divider.style.left = (wrapRect.width * dividerFraction) + "px";
+  }
+
+  lulcLeft.on('load', applyClip);
+  lulcRight.on('load', applyClip);
+  map.on('move zoom moveend zoomend', applyClip);
+  window.addEventListener('resize', applyClip);
+  setTimeout(applyClip, 300);
+
+  var isDragging = false;
+  function setDividerFromClientX(clientX) {
+    var wrapRect = mapWrap.getBoundingClientRect();
+    var frac = (clientX - wrapRect.left) / wrapRect.width;
+    dividerFraction = Math.min(1, Math.max(0, frac));
+    applyClip();
+  }
+  divider.addEventListener('mousedown', function(e) { isDragging = true; e.preventDefault(); });
+  window.addEventListener('mousemove', function(e) { if (isDragging) setDividerFromClientX(e.clientX); });
+  window.addEventListener('mouseup', function() { isDragging = false; });
+  divider.addEventListener('touchstart', function(e) { isDragging = true; }, { passive: true });
+  window.addEventListener('touchmove', function(e) {
+    if (isDragging && e.touches.length) setDividerFromClientX(e.touches[0].clientX);
+  }, { passive: true });
+  window.addEventListener('touchend', function() { isDragging = false; });
+
+  var coordBox = document.getElementById('coord-box');
+  map.on('click', function(e) {
+    var lat = e.latlng.lat.toFixed(6);
+    var lng = e.latlng.lng.toFixed(6);
+    coordBox.innerHTML = "Clicked: Lat " + lat + ", Lon " + lng;
+  });
+
+} catch (err) {
+  showErr(err.message || String(err));
+}
+</script>
+</body>
+</html>
+"""
+
+map_html = (
+    _MAP_TEMPLATE
+    .replace("__HEIGHT_PX__", str(MAP_HEIGHT_PX))
+    .replace("__LEFT_LABEL__", left_period)
+    .replace("__RIGHT_LABEL__", right_period)
+    .replace("__CENTER_LAT__", str(center_lat))
+    .replace("__CENTER_LON__", str(center_lon))
+    .replace("__LEFT_BOUNDS__", json.dumps(bounds_left))
+    .replace("__RIGHT_BOUNDS__", json.dumps(bounds_right))
+    .replace("__FIT_BOUNDS__", json.dumps(fit_bounds_latlon))
+    .replace("__URI_LEFT__", uri_left)
+    .replace("__URI_RIGHT__", uri_right)
+    .replace("__OPACITY__", str(overlay_opacity))
+    .replace("__GEOJSON__", boundary_geojson_str)
 )
 
+try:
+    components.html(map_html, height=MAP_HEIGHT_PX + 10, scrolling=False)
+except Exception as e:
+    st.error(f"Map component failed to render: {e}")
+
+_mask_note = (
+    "LULC colour is restricted to strictly inside the glowing boundary — everything else is transparent."
+    if restrict_colors_to_boundary else
+    "LULC colour covers the full classified area (like ESA WorldCover) — the glowing outline just highlights your boundary; toggle "
+    "'Restrict LULC colours to boundary only' in the sidebar to crop colour strictly to it."
+)
+st.caption(
+    "🟢 Drag the center handle to sweep between **" + left_period + "** and **" + right_period +
+    "**. The pink/yellow glowing outline is your boundary — it never moves or changes as you swipe. " + _mask_note
+)
 
 # ==============================================================================
-# CLICK ANYWHERE POINT INSPECTOR & TIMELINE
+# ANALYSIS SECTION (scoped to the selected boundary feature)
 # ==============================================================================
 st.markdown("---")
-st.subheader("📍 Point Inspection & Temporal LULC Timeline")
+st.subheader(f"📊 LULC Change & Analysis — {selected_feature}")
 
-if map_output and map_output.get("last_clicked"):
-    click_lat = map_output["last_clicked"]["lat"]
-    click_lon = map_output["last_clicked"]["lng"]
+time_stats = []
+for yr in sorted_periods:
+    pixels = extract_masked_statistics(raster_dict[yr], selection_wkt)
+    if len(pixels) > 0:
+        df_p = pd.DataFrame({"class_code": pixels})
+        df_p["Land Use"] = df_p["class_code"].map(lambda c: CLASS_INFO[c]["name"])
+        grp = df_p.groupby("Land Use").size().reset_index(name="Pixel Count")
+        tot = grp["Pixel Count"].sum()
+        grp["Percentage (%)"] = ((grp["Pixel Count"] / tot) * 100).round(2)
+        grp["Period"] = yr
+        time_stats.append(grp)
 
-    timeline_data = sample_point_across_rasters(click_lat, click_lon, raster_dict)
+if not time_stats:
+    st.warning("No valid LULC pixels found inside this boundary for any uploaded period. "
+               "Check that your raster(s) and boundary cover the same geographic area.")
+else:
+    all_df = pd.concat(time_stats, ignore_index=True)
 
-    st.write(f"**Inspected Coordinate:** Lat `{click_lat:.5f}`, Lon `{click_lon:.5f}`")
+    left_stats = all_df[all_df["Period"] == left_period].sort_values("Percentage (%)", ascending=False)
+    right_stats = all_df[all_df["Period"] == right_period].sort_values("Percentage (%)", ascending=False)
 
-    timeline_rows = []
-    for yr_name, info in timeline_data.items():
-        timeline_rows.append({
-            "LULC Period": yr_name,
-            "Class Code": info["code"],
-            "Land Use": info["class"]
-        })
+    c1, c2, c3 = st.columns(3)
+    if not left_stats.empty:
+        top_left = left_stats.iloc[0]
+        c1.metric(f"Dominant Land Use ({left_period})", top_left["Land Use"], f"{top_left['Percentage (%)']}%")
+    if not right_stats.empty:
+        top_right = right_stats.iloc[0]
+        c2.metric(f"Dominant Land Use ({right_period})", top_right["Land Use"], f"{top_right['Percentage (%)']}%")
+        c3.metric("Current Primary Land Use", f"{top_right['Land Use']}")
 
-    df_timeline = pd.DataFrame(timeline_rows)
+    st.markdown("### LULC Distribution Inside the Selected Boundary — T1 vs T2")
+    fig = px.bar(
+        all_df[all_df["Period"].isin([left_period, right_period])],
+        x="Period", y="Percentage (%)", color="Land Use",
+        barmode="group",
+        color_discrete_map={v["name"]: v["color"] for v in CLASS_INFO.values()},
+        text="Percentage (%)"
+    )
+    fig.update_layout(height=400, plot_bgcolor="#161b22", paper_bgcolor="#161b22", font_color="#ffffff")
+    st.plotly_chart(fig, use_container_width=True)
 
-    col_t1, col_t2 = st.columns([1, 1.5])
-    with col_t1:
-        st.dataframe(df_timeline, hide_index=True, use_container_width=True)
-
-    with col_t2:
-        fig_time = px.line(
-            df_timeline, x="LULC Period", y="Land Use", markers=True,
-            title="LULC Trajectory at Clicked Point",
+    # --------------------------------------------------------------------
+    # MULTI-YEAR CAUSATION TIMELINE (within the selected boundary)
+    # --------------------------------------------------------------------
+    if len(sorted_periods) > 1:
+        st.markdown("### 📈 Land Use Change Over Time Inside the Boundary")
+        st.caption(
+            "Percentage share of each LULC class inside the selected boundary, for every "
+            "uploaded period — watch which class grows right before the landslide period."
         )
-        fig_time.update_layout(height=280, plot_bgcolor="#121824", paper_bgcolor="#121824", font_color="#ffffff")
-        st.plotly_chart(fig_time, use_container_width=True)
-else:
-    st.info("👆 Map-la edhavadhu oru spot-a click pannunga, andha spot-oda multi-year land use change timeline inga live-a kaattum.")
+        fig_stack = px.bar(
+            all_df, x="Period", y="Percentage (%)", color="Land Use",
+            barmode="stack",
+            color_discrete_map={v["name"]: v["color"] for v in CLASS_INFO.values()},
+            title="LULC Composition Over Time"
+        )
+        fig_stack.update_layout(height=420, plot_bgcolor="#161b22", paper_bgcolor="#161b22", font_color="#ffffff")
+        st.plotly_chart(fig_stack, use_container_width=True)
 
-
-# ==============================================================================
-# LANDSLIDE BUFFER AREA ANALYSIS
-# ==============================================================================
-st.markdown("---")
-st.subheader("📊 Landslide Area LULC Causation Analytics")
-
-if buffered_gdf is None:
-    st.warning("Upload a Landslide Shapefile/KML in the sidebar to run buffer extraction analysis.")
-else:
-    target_stat_year = st.selectbox("Select Year for Landslide Zone Analysis", sorted_periods)
-    pixels = extract_masked_statistics(raster_dict[target_stat_year], buffered_gdf)
-
-    if len(pixels) == 0:
-        st.error("No valid pixels found within the landslide zones. Verify spatial overlap / CRS.")
-    else:
-        df_px = pd.DataFrame({"class_code": pixels})
-        df_px["Land Use"] = df_px["class_code"].map(lambda c: CLASS_INFO[c]["name"])
-
-        summary = df_px.groupby("Land Use").size().reset_index(name="Pixel Count")
-        total_px = summary["Pixel Count"].sum()
-        summary["Percentage (%)"] = ((summary["Pixel Count"] / total_px) * 100).round(2)
-        summary["Color"] = summary["Land Use"].map({v["name"]: v["color"] for v in CLASS_INFO.values()})
-        summary = summary.sort_values("Percentage (%)", ascending=False)
-
-        top_cause = summary.iloc[0]
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Analyzed Zone Pixels", f"{total_px:,}")
-        m2.metric("Primary Causative Cover", top_cause["Land Use"])
-        m3.metric("Dominant Cover Share", f"{top_cause['Percentage (%)']}%")
-
-        c_chart, c_table = st.columns([1.4, 1])
-
-        with c_chart:
-            fig_bar = px.bar(
-                summary, x="Percentage (%)", y="Land Use", orientation="h",
-                text="Percentage (%)", color="Land Use",
-                color_discrete_map={r["Land Use"]: r["Color"] for _, r in summary.iterrows()},
-                title=f"LULC Breakdown within Landslide Zone ({target_stat_year})"
+        watch_classes = ["Dense Forest", "Tea / Plantation", "Bare Land / Exposed Soil", "Built-up / Urban"]
+        df_watch = all_df[all_df["Land Use"].isin(watch_classes)]
+        if not df_watch.empty:
+            fig_trend = px.line(
+                df_watch, x="Period", y="Percentage (%)", color="Land Use", markers=True,
+                color_discrete_map={v["name"]: v["color"] for v in CLASS_INFO.values()},
+                title="Vegetation Loss vs. Bare/Built-up Exposure Trend"
             )
-            fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
-            fig_bar.update_layout(showlegend=False, height=360, plot_bgcolor="#121824", paper_bgcolor="#121824", font_color="#ffffff")
-            st.plotly_chart(fig_bar, use_container_width=True)
+            fig_trend.update_layout(height=340, plot_bgcolor="#161b22", paper_bgcolor="#161b22", font_color="#ffffff")
+            st.plotly_chart(fig_trend, use_container_width=True)
 
-        with c_table:
-            st.dataframe(summary[["Land Use", "Pixel Count", "Percentage (%)"]], hide_index=True, use_container_width=True)
+        with st.expander("📋 Full year-by-year breakdown table"):
+            pivot = all_df.pivot(index="Land Use", columns="Period", values="Percentage (%)").fillna(0)
+            st.dataframe(pivot, use_container_width=True)
+
+    with st.expander(f"📋 Detailed table — {left_period} vs {right_period}"):
+        st.dataframe(
+            all_df[all_df["Period"].isin([left_period, right_period])][["Period", "Land Use", "Pixel Count", "Percentage (%)"]],
+            hide_index=True, use_container_width=True,
+        )
